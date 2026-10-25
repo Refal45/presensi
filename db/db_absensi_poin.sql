@@ -195,6 +195,9 @@ CREATE TABLE `users` (
   `updated_at` timestamp NULL DEFAULT current_timestamp() ON UPDATE current_timestamp()
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+INSERT INTO `users` (`id`, `nim`, `name`, `email`, `password`, `role`, `class_name`, `is_active`, `email_verified_at`, `remember_token`, `created_at`, `updated_at`) VALUES
+(1, NULL, 'Administrator', 'admin.presensi@presensimahasiswa.com', '$2y$10$FM4GY13dZtlHyLvRx8usvOUyABxojbmaD707dWK6dRlM6CXL0weYG', 'admin', NULL, 1, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+
 -- --------------------------------------------------------
 
 --

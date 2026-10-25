@@ -1,15 +1,4 @@
 <?php
-
-/**
- * beranda.php
- * Halaman Utama — Presensi NFC | Sistem Kehadiran Mahasiswa
- * ------------------------------------------------------------
- * VERSI PUBLIK — Layout terinspirasi DreamHome index.php
- * Database : db_absensi_poin
- * Tabel    : users, schedules, attendances, ...
- * ------------------------------------------------------------
- */
-
 require_once __DIR__ . '/koneksi.php';
 
 /* ============================================================
