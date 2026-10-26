@@ -8,18 +8,20 @@
  * Bergantung pada: koneksi.php (variabel $conn MySQLi), login.php,
  * index.php, logout.php, background.jpg, dan halaman menu lainnya.
  *
- * Layout:
- *  - Desktop  : sidebar tetap (sticky) + konten di kanan.
- *  - Mobile   : pola aplikasi native — app bar sticky di atas,
- *               bottom tab bar (fixed) + bottom sheet menu,
- *               hero full-bleed, kartu statistik 2 kolom,
- *               safe-area aware (notch / home indicator).
+ * Aktivitas Terbaru menggabungkan:
+ *  - activity_logs      (login, logout, dll. yang dicatat aplikasi)
+ *  - attendances        (absensi mahasiswa)
+ *  - leave_requests     (pengajuan izin / sakit)
+ *  - point_transactions (perubahan poin disiplin)
+ *  - nfc_cards          (terakhir kartu NFC dipakai)
+ * sehingga aktivitas mahasiswa tetap tampil walau login.php
+ * belum menulis ke activity_logs.
  */
 
 date_default_timezone_set('Asia/Jakarta');
 
 // ============================================================
-// 1. SESSION & OTORISASI (dijalankan sebelum output HTML apa pun)
+// 1. SESSION & OTORISASI
 // ============================================================
 if (session_status() === PHP_SESSION_NONE) {
     session_set_cookie_params([
@@ -56,6 +58,7 @@ if ($sessionRole !== 'admin') {
     redirect_to('login.php');
 }
 
+$adminId   = (int)$_SESSION['user_id'];
 $adminName = trim((string)($_SESSION['name'] ?? ''));
 if ($adminName === '') {
     $adminName = 'Administrator';
@@ -122,7 +125,74 @@ function format_waktu(?string $timestamp): string
         return '-';
     }
     $bulan = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
-    return date('j', $t) . ' ' . $bulan[(int)date('n', $t) - 1] . ' ' . date('Y, H:i', $t);
+    return date('j', $t) . ' ' . $bulan[(int)date('n', $t) - 1] . ' ' . date('Y, H:i:s', $t);
+}
+
+/**
+ * Tentukan ikon & warna berdasarkan teks aksi.
+ * @return array{0:string,1:string} [id ikon, tone]
+ */
+function activity_style(?string $action): array
+{
+    $a = strtolower((string)$action);
+
+    $map = [
+        ['logout',   'i-logout',    'red'],
+        ['keluar',   'i-logout',    'red'],
+        ['login',    'i-login',     'green'],
+        ['masuk',    'i-login',     'green'],
+        ['terlambat', 'i-check',    'amber'],
+        ['absen',    'i-check',     'green'],
+        ['presensi', 'i-check',     'green'],
+        ['check',    'i-check',     'green'],
+        ['nfc',      'i-nfc',       'blue'],
+        ['izin',     'i-mail',      'amber'],
+        ['sakit',    'i-mail',      'amber'],
+        ['poin',     'i-star',      'amber'],
+        ['jadwal',   'i-calendar',  'blue'],
+        ['password', 'i-shield',    'red'],
+        ['hapus',    'i-info',      'red'],
+        ['delete',   'i-info',      'red'],
+    ];
+
+    foreach ($map as [$needle, $icon, $tone]) {
+        if ($a !== '' && strpos($a, $needle) !== false) {
+            return [$icon, $tone];
+        }
+    }
+    return ['i-info', 'blue'];
+}
+
+// ============================================================
+// 3b. CATAT LOGIN ADMIN (sekali per sesi, tanpa duplikat)
+// ============================================================
+if (empty($_SESSION['login_logged'])) {
+    try {
+        $dupe = fetch_total(
+            $db,
+            "SELECT COUNT(id) FROM activity_logs
+             WHERE user_id = ? AND action LIKE 'Login%'
+               AND created_at >= (NOW() - INTERVAL 2 MINUTE)",
+            'i',
+            [$adminId]
+        );
+
+        if ($dupe === 0) {
+            $stmtLog = $db->prepare(
+                "INSERT INTO activity_logs (user_id, action, description, ip_address)
+                 VALUES (?, 'Login', 'Admin masuk ke dashboard', ?)"
+            );
+            if ($stmtLog) {
+                $ipAddr = substr((string)($_SERVER['REMOTE_ADDR'] ?? ''), 0, 45);
+                $stmtLog->bind_param('is', $adminId, $ipAddr);
+                $stmtLog->execute();
+                $stmtLog->close();
+            }
+        }
+    } catch (Throwable $ex) {
+        error_log('[index2.php] Gagal mencatat login: ' . $ex->getMessage());
+    }
+    $_SESSION['login_logged'] = true;
 }
 
 // ============================================================
@@ -160,26 +230,112 @@ $statCards = [
 ];
 
 // ============================================================
-// 5. AKTIVITAS TERBARU (maks. 5)
+// 5. AKTIVITAS TERBARU — gabungan log + data absensi/izin/poin/NFC
 // ============================================================
+const ACTIVITY_LIMIT = 100;
+
 $activities = [];
+$activityCount = ['semua' => 0, 'admin' => 0, 'mahasiswa' => 0];
+
 try {
-    $sqlLog = "SELECT al.action, al.description, al.created_at, u.name AS user_name
-               FROM activity_logs al
-               LEFT JOIN users u ON u.id = al.user_id
-               ORDER BY al.created_at DESC, al.id DESC
-               LIMIT 5";
+    $lim = (int)ACTIVITY_LIMIT;
+
+    $sqlLog = "
+        SELECT ev.action, ev.description, ev.ip_address, ev.event_at,
+               u.name AS user_name, u.role AS user_role,
+               u.nim AS user_nim, u.class_name AS user_class
+        FROM (
+            (SELECT al.user_id,
+                    al.action,
+                    al.description,
+                    al.ip_address,
+                    al.created_at AS event_at
+             FROM activity_logs al
+             ORDER BY al.created_at DESC
+             LIMIT $lim)
+
+            UNION ALL
+
+            (SELECT a.user_id,
+                    CASE a.status
+                        WHEN 'hadir'     THEN 'Absensi Hadir'
+                        WHEN 'terlambat' THEN 'Absensi Terlambat'
+                        WHEN 'izin'      THEN 'Absensi Izin'
+                        WHEN 'sakit'     THEN 'Absensi Sakit'
+                        ELSE 'Absensi Alpha'
+                    END,
+                    CONCAT(s.course_name, ' (', s.class_name, ')'),
+                    NULL,
+                    COALESCE(a.check_in_at, a.created_at)
+             FROM attendances a
+             JOIN schedules s ON s.id = a.schedule_id
+             ORDER BY COALESCE(a.check_in_at, a.created_at) DESC
+             LIMIT $lim)
+
+            UNION ALL
+
+            (SELECT lr.user_id,
+                    CASE lr.request_type
+                        WHEN 'sakit' THEN 'Ajukan Sakit'
+                        ELSE 'Ajukan Izin'
+                    END,
+                    CONCAT('Status: ', lr.status, ' — ', LEFT(lr.reason, 120)),
+                    NULL,
+                    lr.created_at
+             FROM leave_requests lr
+             ORDER BY lr.created_at DESC
+             LIMIT $lim)
+
+            UNION ALL
+
+            (SELECT pt.user_id,
+                    'Poin Disiplin',
+                    CONCAT(IF(pt.points_change > 0, '+', ''), pt.points_change, ' poin — ', pt.reason),
+                    NULL,
+                    pt.created_at
+             FROM point_transactions pt
+             ORDER BY pt.created_at DESC
+             LIMIT $lim)
+
+            UNION ALL
+
+            (SELECT nc.user_id,
+                    'Tap Kartu NFC',
+                    CONCAT('Kartu ', COALESCE(NULLIF(nc.label, ''), nc.card_uid), ' digunakan'),
+                    NULL,
+                    nc.last_used_at
+             FROM nfc_cards nc
+             WHERE nc.last_used_at IS NOT NULL
+             ORDER BY nc.last_used_at DESC
+             LIMIT $lim)
+        ) ev
+        LEFT JOIN users u ON u.id = ev.user_id
+        WHERE ev.event_at IS NOT NULL
+        ORDER BY ev.event_at DESC
+        LIMIT $lim";
+
     if ($result = $db->query($sqlLog)) {
         while ($row = $result->fetch_assoc()) {
+            $role = $row['user_role'] ?? '';
+            $row['role_key'] = in_array($role, ['admin', 'mahasiswa'], true) ? $role : 'sistem';
             $activities[] = $row;
+
+            $activityCount['semua']++;
+            if ($row['role_key'] === 'admin') {
+                $activityCount['admin']++;
+            } elseif ($row['role_key'] === 'mahasiswa') {
+                $activityCount['mahasiswa']++;
+            }
         }
         $result->free();
     } else {
-        error_log('[index2.php] Query log gagal: ' . $db->error);
+        error_log('[index2.php] Query aktivitas gagal: ' . $db->error);
     }
 } catch (Throwable $ex) {
     error_log('[index2.php] ' . $ex->getMessage());
 }
+
+$roleLabels = ['admin' => 'Admin', 'mahasiswa' => 'Mahasiswa', 'sistem' => 'Sistem'];
 
 // ============================================================
 // 6. MENU SIDEBAR
@@ -219,9 +375,6 @@ $currentPage = 'index2.php';
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 
     <style>
-        /* ============================================================
-           DESIGN TOKENS
-           ============================================================ */
         :root {
             --navy: #0B1220;
             --sidebar: #0F1B2D;
@@ -324,9 +477,6 @@ $currentPage = 'index2.php';
             stroke-linejoin: round;
         }
 
-        /* ============================================================
-           LAYOUT UTAMA
-           ============================================================ */
         .app {
             display: grid;
             grid-template-columns: var(--sidebar-w) minmax(0, 1fr);
@@ -335,9 +485,6 @@ $currentPage = 'index2.php';
             background-color: var(--navy);
         }
 
-        /* ============================================================
-           SIDEBAR (desktop)
-           ============================================================ */
         .sidebar {
             position: sticky;
             top: 0;
@@ -483,9 +630,6 @@ $currentPage = 'index2.php';
             transition: opacity var(--speed), visibility var(--speed);
         }
 
-        /* ============================================================
-           AREA UTAMA
-           ============================================================ */
         .main {
             min-width: 0;
             display: flex;
@@ -504,10 +648,6 @@ $currentPage = 'index2.php';
             min-width: 0;
         }
 
-        /* ============================================================
-           HERO BANNER
-           Tinggi mengikuti rasio asli foto — gambar tampil utuh.
-           ============================================================ */
         .hero {
             width: 100%;
             border-radius: var(--radius);
@@ -516,14 +656,12 @@ $currentPage = 'index2.php';
             background-color: var(--navy);
             overflow: hidden;
             line-height: 0;
-            /* hilangkan gap inline di bawah <img> */
         }
 
         .hero-img {
             display: block;
             width: 100%;
             height: auto;
-            /* tinggi mengikuti rasio asli gambar */
             object-fit: contain;
             max-width: 100%;
         }
@@ -535,7 +673,6 @@ $currentPage = 'index2.php';
             box-shadow: var(--shadow);
         }
 
-        /* --- Header / App bar --- */
         .topbar {
             display: flex;
             align-items: center;
@@ -635,7 +772,6 @@ $currentPage = 'index2.php';
             font-weight: 800;
         }
 
-        /* --- Welcome --- */
         .welcome {
             display: grid;
             grid-template-columns: minmax(0, 1fr) auto;
@@ -677,7 +813,6 @@ $currentPage = 'index2.php';
             height: 34px;
         }
 
-        /* --- Statistik --- */
         .stats {
             display: grid;
             grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -751,7 +886,6 @@ $currentPage = 'index2.php';
             color: var(--text-2);
         }
 
-        /* --- Aksi cepat (khusus mobile) --- */
         .quick {
             display: none;
             padding: var(--card-pad);
@@ -803,7 +937,6 @@ $currentPage = 'index2.php';
             color: var(--cyan);
         }
 
-        /* --- Aktivitas --- */
         .activity {
             padding: var(--card-pad) 24px;
         }
@@ -844,16 +977,105 @@ $currentPage = 'index2.php';
             text-decoration: underline;
         }
 
+        .filters {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            padding: 14px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-height: 36px;
+            padding: 6px 14px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            background: var(--panel-2);
+            color: var(--text-2);
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color var(--speed), color var(--speed), border-color var(--speed);
+        }
+
+        .chip:hover {
+            color: var(--text);
+            border-color: rgba(66, 232, 213, 0.45);
+        }
+
+        .chip.is-active {
+            background: rgba(66, 232, 213, 0.14);
+            border-color: var(--cyan);
+            color: var(--cyan);
+        }
+
+        .chip-count {
+            min-width: 22px;
+            padding: 0 7px;
+            border-radius: 999px;
+            background: rgba(148, 163, 184, 0.18);
+            font-size: 11px;
+            font-weight: 700;
+            line-height: 20px;
+            text-align: center;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .chip.is-active .chip-count {
+            background: rgba(66, 232, 213, 0.22);
+        }
+
+        .activity-list {
+            max-height: 560px;
+            overflow-y: auto;
+            -webkit-overflow-scrolling: touch;
+            overscroll-behavior: contain;
+            padding-right: 6px;
+            margin-right: -6px;
+        }
+
+        .activity-list[hidden] {
+            display: none;
+        }
+
+        .activity-list::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .activity-list::-webkit-scrollbar-thumb {
+            background: rgba(148, 163, 184, 0.28);
+            border-radius: 6px;
+        }
+
         .activity-item {
+            --tone: var(--blue);
+            --tone-bg: rgba(56, 189, 248, 0.14);
             display: flex;
             gap: 14px;
             padding: 16px 0;
             border-bottom: 1px solid var(--border);
         }
 
-        .activity-item:last-child {
-            border-bottom: 0;
-            padding-bottom: 0;
+        .activity-item[hidden] {
+            display: none;
+        }
+
+        .activity-item.tone-green {
+            --tone: var(--green);
+            --tone-bg: rgba(34, 197, 94, 0.14);
+        }
+
+        .activity-item.tone-amber {
+            --tone: var(--amber);
+            --tone-bg: rgba(251, 191, 36, 0.14);
+        }
+
+        .activity-item.tone-red {
+            --tone: var(--red);
+            --tone-bg: rgba(248, 113, 113, 0.14);
         }
 
         .activity-icon {
@@ -863,8 +1085,8 @@ $currentPage = 'index2.php';
             height: 36px;
             flex-shrink: 0;
             border-radius: 50%;
-            background: rgba(56, 189, 248, 0.14);
-            color: var(--blue);
+            background: var(--tone-bg);
+            color: var(--tone);
         }
 
         .activity-icon .icon {
@@ -881,7 +1103,7 @@ $currentPage = 'index2.php';
             display: flex;
             align-items: center;
             flex-wrap: wrap;
-            gap: 4px 10px;
+            gap: 4px 8px;
             font-size: 14px;
         }
 
@@ -901,6 +1123,43 @@ $currentPage = 'index2.php';
             overflow-wrap: anywhere;
         }
 
+        .badge-action {
+            border-color: var(--tone);
+            background: var(--tone-bg);
+            color: var(--tone);
+        }
+
+        .badge-role {
+            font-size: 11px;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        .badge-role--admin {
+            border-color: rgba(251, 191, 36, 0.4);
+            background: rgba(251, 191, 36, 0.12);
+            color: var(--amber);
+        }
+
+        .badge-role--mahasiswa {
+            border-color: rgba(56, 189, 248, 0.4);
+            background: rgba(56, 189, 248, 0.12);
+            color: var(--blue);
+        }
+
+        .badge-role--sistem {
+            border-color: rgba(168, 183, 204, 0.35);
+            background: rgba(168, 183, 204, 0.1);
+            color: var(--text-2);
+        }
+
+        .activity-meta {
+            margin-top: 2px;
+            font-size: 12px;
+            color: var(--text-2);
+            overflow-wrap: anywhere;
+        }
+
         .activity-desc {
             margin-top: 4px;
             color: var(--text-2);
@@ -909,9 +1168,20 @@ $currentPage = 'index2.php';
         }
 
         .activity-time {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2px 12px;
             margin-top: 6px;
             font-size: 12px;
             color: var(--text-2);
+        }
+
+        .activity-foot {
+            padding-top: 14px;
+            border-top: 1px solid var(--border);
+            font-size: 12px;
+            color: var(--text-2);
+            text-align: center;
         }
 
         .empty {
@@ -925,13 +1195,16 @@ $currentPage = 'index2.php';
             text-align: center;
         }
 
+        .empty[hidden] {
+            display: none;
+        }
+
         .empty .icon {
             width: 36px;
             height: 36px;
             opacity: 0.7;
         }
 
-        /* --- Footer --- */
         .footer {
             padding: 4px 4px 0;
             color: var(--text-2);
@@ -939,9 +1212,6 @@ $currentPage = 'index2.php';
             text-align: center;
         }
 
-        /* ============================================================
-           BOTTOM TAB BAR (khusus mobile)
-           ============================================================ */
         .tabbar {
             display: none;
             position: fixed;
@@ -1010,9 +1280,6 @@ $currentPage = 'index2.php';
             transform: translateX(-50%) scaleX(1);
         }
 
-        /* ============================================================
-           RESPONSIVE — TABLET & MOBILE
-           ============================================================ */
         @media (max-width: 1280px) {
             .stats {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1030,7 +1297,6 @@ $currentPage = 'index2.php';
                 grid-template-columns: minmax(0, 1fr);
             }
 
-            /* --- Sidebar jadi bottom-sheet drawer --- */
             .sidebar {
                 position: fixed;
                 top: 0;
@@ -1066,7 +1332,6 @@ $currentPage = 'index2.php';
                 display: grid;
             }
 
-            /* --- Layout konten full-bleed --- */
             .main {
                 padding: 0;
                 gap: 0;
@@ -1078,7 +1343,6 @@ $currentPage = 'index2.php';
                 gap: 14px;
             }
 
-            /* --- App bar sticky --- */
             .topbar {
                 position: sticky;
                 top: 0;
@@ -1136,7 +1400,6 @@ $currentPage = 'index2.php';
                 height: 20px;
             }
 
-            /* --- Hero full-bleed --- */
             .hero {
                 margin-inline: calc(var(--pad) * -1);
                 border-radius: 0;
@@ -1144,14 +1407,13 @@ $currentPage = 'index2.php';
                 border-right: 0;
                 border-top: 0;
                 box-shadow: none;
+                width: auto;
             }
 
-            /* --- Tab bar tampil --- */
             .tabbar {
                 display: grid;
             }
 
-            /* --- Welcome ringkas --- */
             .welcome {
                 grid-template-columns: minmax(0, 1fr);
                 gap: 0;
@@ -1171,7 +1433,6 @@ $currentPage = 'index2.php';
                 display: none;
             }
 
-            /* --- Aksi cepat tampil --- */
             .quick {
                 display: block;
             }
@@ -1180,7 +1441,10 @@ $currentPage = 'index2.php';
                 padding: var(--card-pad) 16px;
             }
 
-            /* --- Efek tekan untuk kartu --- */
+            .activity-list {
+                max-height: 480px;
+            }
+
             .stat:active,
             .activity-item:active {
                 transform: scale(0.99);
@@ -1247,6 +1511,23 @@ $currentPage = 'index2.php';
             .activity {
                 padding: var(--card-pad) 14px;
                 border-radius: 14px;
+            }
+
+            .filters {
+                flex-wrap: nowrap;
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+                scrollbar-width: none;
+            }
+
+            .filters::-webkit-scrollbar {
+                display: none;
+            }
+
+            .chip {
+                flex-shrink: 0;
+                padding: 6px 12px;
+                font-size: 12.5px;
             }
 
             .activity-item {
@@ -1390,6 +1671,11 @@ $currentPage = 'index2.php';
             <polyline points="16 17 21 12 16 7" />
             <line x1="21" y1="12" x2="9" y2="12" />
         </symbol>
+        <symbol id="i-login" viewBox="0 0 24 24">
+            <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" />
+            <polyline points="10 17 15 12 10 7" />
+            <line x1="15" y1="12" x2="3" y2="12" />
+        </symbol>
         <symbol id="i-menu" viewBox="0 0 24 24">
             <line x1="3" y1="6" x2="21" y2="6" />
             <line x1="3" y1="12" x2="21" y2="12" />
@@ -1460,7 +1746,6 @@ $currentPage = 'index2.php';
         <!-- ======================= KONTEN UTAMA ======================= -->
         <div class="main">
 
-            <!-- App bar (sticky di mobile, panel biasa di desktop) -->
             <header class="topbar panel">
                 <div class="topbar-left">
                     <button type="button" class="menu-toggle" id="menuToggle"
@@ -1486,7 +1771,7 @@ $currentPage = 'index2.php';
 
             <div class="page">
 
-                <!-- Hero banner: tinggi mengikuti rasio asli background.jpg -->
+                <!-- Hero banner -->
                 <section class="hero" aria-hidden="true">
                     <img class="hero-img" src="background.jpg" alt="" width="1600" height="600"
                         loading="eager" decoding="async">
@@ -1553,7 +1838,7 @@ $currentPage = 'index2.php';
                     </div>
                 </section>
 
-                <!-- Aktivitas -->
+                <!-- Aktivitas Terbaru (admin + mahasiswa) -->
                 <section class="activity panel" aria-labelledby="activityTitle">
                     <div class="activity-head">
                         <h3 id="activityTitle">
@@ -1566,27 +1851,75 @@ $currentPage = 'index2.php';
                     </div>
 
                     <?php if (!empty($activities)): ?>
-                        <ul>
+                        <div class="filters" role="group" aria-label="Filter aktivitas berdasarkan role">
+                            <button type="button" class="chip is-active" data-filter="semua" aria-pressed="true">
+                                Semua <span class="chip-count"><?= (int)$activityCount['semua'] ?></span>
+                            </button>
+                            <button type="button" class="chip" data-filter="admin" aria-pressed="false">
+                                Admin <span class="chip-count"><?= (int)$activityCount['admin'] ?></span>
+                            </button>
+                            <button type="button" class="chip" data-filter="mahasiswa" aria-pressed="false">
+                                Mahasiswa <span class="chip-count"><?= (int)$activityCount['mahasiswa'] ?></span>
+                            </button>
+                        </div>
+
+                        <ul class="activity-list" id="activityList" tabindex="0" aria-label="Daftar aktivitas">
                             <?php foreach ($activities as $act): ?>
-                                <li class="activity-item">
+                                <?php
+                                [$actIcon, $actTone] = activity_style($act['action'] ?? '');
+                                $roleKey  = $act['role_key'];
+                                $userName = trim((string)($act['user_name'] ?? '')) !== '' ? $act['user_name'] : 'Sistem';
+                                $metaParts = [];
+                                if ($roleKey === 'mahasiswa') {
+                                    if (!empty($act['user_nim'])) {
+                                        $metaParts[] = 'NIM ' . $act['user_nim'];
+                                    }
+                                    if (!empty($act['user_class'])) {
+                                        $metaParts[] = 'Kelas ' . $act['user_class'];
+                                    }
+                                }
+                                ?>
+                                <li class="activity-item tone-<?= e($actTone) ?>" data-role="<?= e($roleKey) ?>">
                                     <div class="activity-icon" aria-hidden="true">
                                         <svg class="icon">
-                                            <use href="#i-info" />
+                                            <use href="#<?= e($actIcon) ?>" />
                                         </svg>
                                     </div>
                                     <div class="activity-body">
                                         <div class="activity-title">
-                                            <strong><?= e($act['user_name'] ?? 'Sistem') ?></strong>
-                                            <span class="badge"><?= e($act['action']) ?></span>
+                                            <strong><?= e($userName) ?></strong>
+                                            <span class="badge badge-role badge-role--<?= e($roleKey) ?>"><?= e($roleLabels[$roleKey]) ?></span>
+                                            <span class="badge badge-action"><?= e($act['action']) ?></span>
                                         </div>
+                                        <?php if (!empty($metaParts)): ?>
+                                            <p class="activity-meta"><?= e(implode(' • ', $metaParts)) ?></p>
+                                        <?php endif; ?>
                                         <?php if (trim((string)$act['description']) !== ''): ?>
                                             <p class="activity-desc"><?= e($act['description']) ?></p>
                                         <?php endif; ?>
-                                        <p class="activity-time"><?= e(format_waktu($act['created_at'])) ?></p>
+                                        <p class="activity-time">
+                                            <span><?= e(format_waktu($act['event_at'])) ?></span>
+                                            <?php if (!empty($act['ip_address'])): ?>
+                                                <span>IP: <?= e($act['ip_address']) ?></span>
+                                            <?php endif; ?>
+                                        </p>
                                     </div>
                                 </li>
                             <?php endforeach; ?>
                         </ul>
+
+                        <div class="empty" id="filterEmpty" hidden>
+                            <svg class="icon" aria-hidden="true">
+                                <use href="#i-inbox" />
+                            </svg>
+                            <p>Tidak ada aktivitas untuk filter ini.</p>
+                        </div>
+
+                        <p class="activity-foot">
+                            Menampilkan <?= (int)$activityCount['semua'] ?> aktivitas terbaru
+                            <?= $activityCount['semua'] >= ACTIVITY_LIMIT ? '(maks. ' . (int)ACTIVITY_LIMIT . ')' : '' ?>.
+                            Buka <a href="log.php" style="color:var(--blue)">Log Aktivitas</a> untuk riwayat lengkap.
+                        </p>
                     <?php else: ?>
                         <div class="empty">
                             <svg class="icon" aria-hidden="true">
@@ -1651,6 +1984,45 @@ $currentPage = 'index2.php';
             var backdrop = document.getElementById('backdrop');
             var BREAKPOINT = 1024;
 
+            /* ---------- Filter aktivitas berdasarkan role ---------- */
+            var chips = document.querySelectorAll('.chip[data-filter]');
+            var items = document.querySelectorAll('#activityList .activity-item');
+            var emptyBox = document.getElementById('filterEmpty');
+            var listBox = document.getElementById('activityList');
+
+            function applyFilter(filter) {
+                var visible = 0;
+
+                items.forEach(function(li) {
+                    var show = (filter === 'semua') || (li.getAttribute('data-role') === filter);
+                    li.hidden = !show;
+                    if (show) {
+                        visible++;
+                    }
+                });
+
+                chips.forEach(function(chip) {
+                    var on = chip.getAttribute('data-filter') === filter;
+                    chip.classList.toggle('is-active', on);
+                    chip.setAttribute('aria-pressed', on ? 'true' : 'false');
+                });
+
+                if (emptyBox) {
+                    emptyBox.hidden = visible !== 0;
+                }
+                if (listBox) {
+                    listBox.hidden = visible === 0;
+                    listBox.scrollTop = 0;
+                }
+            }
+
+            chips.forEach(function(chip) {
+                chip.addEventListener('click', function() {
+                    applyFilter(chip.getAttribute('data-filter'));
+                });
+            });
+
+            /* ---------- Drawer navigasi ---------- */
             if (!toggle || !sidebar || !backdrop) {
                 return;
             }
@@ -1684,14 +2056,12 @@ $currentPage = 'index2.php';
                 setOpen(false);
             });
 
-            // Tutup drawer saat salah satu tautan menu diklik
             sidebar.addEventListener('click', function(e) {
                 if (e.target.closest('a')) {
                     setOpen(false);
                 }
             });
 
-            // Tutup dengan tombol Escape
             document.addEventListener('keydown', function(e) {
                 if (e.key === 'Escape' && isOpen()) {
                     setOpen(false);
@@ -1699,7 +2069,6 @@ $currentPage = 'index2.php';
                 }
             });
 
-            // Tutup otomatis ketika layar melebar ke ukuran desktop
             var resizeTimer = null;
             window.addEventListener('resize', function() {
                 if (resizeTimer) {
@@ -1712,7 +2081,6 @@ $currentPage = 'index2.php';
                 }, 120);
             });
 
-            // Cegah scroll body saat drawer terbuka di iOS
             sidebar.addEventListener('touchmove', function(e) {
                 var nav = sidebar.querySelector('.nav');
                 if (nav && nav.contains(e.target)) {
